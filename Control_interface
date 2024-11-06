@@ -1,0 +1,657 @@
+import tkinter as tk
+from tkinter import simpledialog
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import lgpio
+import time
+import threading
+import uuid
+import math
+import queue
+
+# Constants and scaling factors (default values)
+DEFAULT_STEPS_PER_UNIT = 10000  # Steps per unit distance (e.g., steps per mm)
+DEFAULT_STEPS_PER_RADIAN_X = 81480  # Steps per radian for motor X (theta1)
+DEFAULT_STEPS_PER_RADIAN_Y = 65184  # Steps per radian for motor Y (theta2)
+DEFAULT_STEPS_PER_UNIT_Z = 1000  # Steps per unit distance for motor Z
+
+OBSTACLE_RADIUS = 20  # Radius of obstacles
+ARM_PLOT_LIMIT = 500  # Adjusted plot limits for arm visualization
+
+FORWARD = 1
+BACKWARD = 0
+
+# GPIO Pin Configuration
+X_PUL = 17
+X_DIR = 27
+X_EN = 22
+Y_PUL = 23
+Y_DIR = 24
+Y_EN = 25
+Z_PUL = 16
+Z_DIR = 20
+Z_EN = 21
+
+# Syringe pump GPIO pins
+SYR_PUL = 5
+SYR_DIR = 6
+SYR_EN = 13
+
+# Motor enable/disable levels (depends on your motor driver)
+MOTOR_ENABLE_LEVEL = 0
+MOTOR_DISABLE_LEVEL = 1
+
+class MotorControlGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Robotic Arm Simulator")
+
+        # Initialize lgpio
+        try:
+            self.h = lgpio.gpiochip_open(0)
+        except Exception as e:
+            print(f"Error initializing GPIO: {e}")
+            exit(1)
+
+        # Initialize GPIO pins
+        for pin in [X_PUL, X_DIR, X_EN, Y_PUL, Y_DIR, Y_EN, Z_PUL, Z_DIR, Z_EN, SYR_PUL, SYR_DIR, SYR_EN]:
+            lgpio.gpio_claim_output(self.h, pin)
+        # Disable motors initially
+        for en_pin in [X_EN, Y_EN, Z_EN, SYR_EN]:
+            lgpio.gpio_write(self.h, en_pin, MOTOR_DISABLE_LEVEL)
+
+        # Initialize variables
+        self.speed_x = tk.DoubleVar(value=0.001)
+        self.speed_y = tk.DoubleVar(value=0.001)
+        self.speed_z = tk.DoubleVar(value=0.001)
+        self.running = {
+            'x_forward': False,
+            'x_backward': False,
+            'y_forward': False,
+            'y_backward': False,
+            'z_forward': False,
+            'z_backward': False,
+            'syringe': False  # For syringe pump operation
+        }
+
+        # Robot arm parameters (variables to be adjusted)
+        self.L1 = tk.DoubleVar(value=228)  # Length of the first arm segment
+        self.L2 = tk.DoubleVar(value=136.5)  # Length of the second arm segment
+        self.STEPS_PER_RADIAN_X = tk.DoubleVar(value=DEFAULT_STEPS_PER_RADIAN_X)
+        self.STEPS_PER_RADIAN_Y = tk.DoubleVar(value=DEFAULT_STEPS_PER_RADIAN_Y)
+        self.STEPS_PER_UNIT_Z = tk.DoubleVar(value=DEFAULT_STEPS_PER_UNIT_Z)
+
+        self.x = 0  # Initial x-coordinate of the end effector
+        self.y = self.L1.get() + self.L2.get()  # Initial y-coordinate of the end effector
+        self.z = 0  # Initial z-coordinate of the end effector
+        self.theta1 = 0  # Initial angle of the first joint
+        self.theta2 = 0  # Initial angle of the second joint
+
+        # Movement increment
+        self.move_increment = tk.DoubleVar(value=0.005)
+
+        # Acceleration parameters
+        self.acceleration = tk.DoubleVar(value=5000)  # Steps per second squared
+        self.deceleration = tk.DoubleVar(value=5000)  # Steps per second squared
+
+        # Syringe pump parameters
+        self.inflow_rate = tk.DoubleVar(value=0.001)
+        self.inflow_steps = tk.IntVar(value=1000)
+        self.outflow_rate = tk.DoubleVar(value=0.001)
+        self.outflow_steps = tk.IntVar(value=1000)
+        self.pick_rate = tk.DoubleVar(value=0.0005)
+        self.pick_steps = tk.IntVar(value=500)
+        self.place_rate = tk.DoubleVar(value=0.0005)
+        self.place_steps = tk.IntVar(value=500)
+
+        # Obstacles
+        self.obstacles = []
+
+        # Movement logging
+        self.session_id = uuid.uuid4()
+        self.log_queue = queue.Queue()
+        self.logging_active = True
+        self.logging_thread = threading.Thread(target=self.log_movements)
+        self.logging_thread.daemon = True
+        self.logging_thread.start()
+
+        # Mode flags
+        self.sync_mode = False
+        self.place_object_mode = False
+
+        # Create GUI elements
+        self.create_widgets()
+
+        # Bind keys for real-time control
+        self.root.bind("<Left>", lambda event: self.move_arm('left'))
+        self.root.bind("<Right>", lambda event: self.move_arm('right'))
+        self.root.bind("<Up>", lambda event: self.move_arm('up'))
+        self.root.bind("<Down>", lambda event: self.move_arm('down'))
+        self.root.bind("w", lambda event: self.move_arm('z_up'))
+        self.root.bind("z", lambda event: self.move_arm('z_down'))
+
+        # Ensure GUI updates
+        self.update_gui()
+
+    def create_widgets(self):
+        # Kinematics parameters at the top of the GUI
+        param_frame = tk.Frame(self.root)
+        param_frame.grid(row=0, column=0, columnspan=4, sticky='w')
+
+        tk.Label(param_frame, text="Arm Length L1:").grid(row=0, column=0, sticky='w')
+        tk.Entry(param_frame, textvariable=self.L1, width=10).grid(row=0, column=1, sticky='w')
+        tk.Label(param_frame, text="Arm Length L2:").grid(row=0, column=2, sticky='w')
+        tk.Entry(param_frame, textvariable=self.L2, width=10).grid(row=0, column=3, sticky='w')
+
+        tk.Label(param_frame, text="Steps per radian X:").grid(row=1, column=0, sticky='w')
+        tk.Entry(param_frame, textvariable=self.STEPS_PER_RADIAN_X, width=10).grid(row=1, column=1, sticky='w')
+        tk.Label(param_frame, text="Steps per radian Y:").grid(row=1, column=2, sticky='w')
+        tk.Entry(param_frame, textvariable=self.STEPS_PER_RADIAN_Y, width=10).grid(row=1, column=3, sticky='w')
+
+        tk.Label(param_frame, text="Steps per unit Z:").grid(row=2, column=0, sticky='w')
+        tk.Entry(param_frame, textvariable=self.STEPS_PER_UNIT_Z, width=10).grid(row=2, column=1, sticky='w')
+
+        # Move increment input
+        tk.Label(param_frame, text="Move Increment:").grid(row=2, column=2, sticky='w')
+        tk.Entry(param_frame, textvariable=self.move_increment, width=10).grid(row=2, column=3, sticky='w')
+
+        # Acceleration input
+        tk.Label(param_frame, text="Acceleration (steps/s²):").grid(row=3, column=0, sticky='w')
+        tk.Entry(param_frame, textvariable=self.acceleration, width=10).grid(row=3, column=1, sticky='w')
+        tk.Label(param_frame, text="Deceleration (steps/s²):").grid(row=3, column=2, sticky='w')
+        tk.Entry(param_frame, textvariable=self.deceleration, width=10).grid(row=3, column=3, sticky='w')
+
+        # Speed control sliders
+        speed_frame = tk.Frame(self.root)
+        speed_frame.grid(row=4, column=0, columnspan=4, sticky='w')
+
+        tk.Label(speed_frame, text="Max Speed X (s delay):").grid(row=0, column=0, sticky='w')
+        tk.Scale(speed_frame, from_=0.00001, to=0.01, resolution=0.00001,
+                 orient="horizontal", variable=self.speed_x, length=150).grid(row=0, column=1, sticky='w')
+        tk.Label(speed_frame, text="Max Speed Y (s delay):").grid(row=1, column=0, sticky='w')
+        tk.Scale(speed_frame, from_=0.00001, to=0.01, resolution=0.00001,
+                 orient="horizontal", variable=self.speed_y, length=150).grid(row=1, column=1, sticky='w')
+        tk.Label(speed_frame, text="Max Speed Z (s delay):").grid(row=2, column=0, sticky='w')
+        tk.Scale(speed_frame, from_=0.000001, to=0.01, resolution=0.00001,
+                 orient="horizontal", variable=self.speed_z, length=150).grid(row=2, column=1, sticky='w')
+
+        # Syringe pump controls
+        syringe_frame = tk.LabelFrame(self.root, text="Syringe Pump Controls")
+        syringe_frame.grid(row=5, column=0, columnspan=4, sticky='w')
+
+        # Inflow controls
+        tk.Label(syringe_frame, text="Inflow Rate (s delay):").grid(row=0, column=0, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.inflow_rate, width=10).grid(row=0, column=1, sticky='w')
+        tk.Label(syringe_frame, text="Inflow Steps:").grid(row=0, column=2, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.inflow_steps, width=10).grid(row=0, column=3, sticky='w')
+        tk.Button(syringe_frame, text="Start Inflow", command=self.start_inflow).grid(row=0, column=4)
+
+        # Outflow controls
+        tk.Label(syringe_frame, text="Outflow Rate (s delay):").grid(row=1, column=0, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.outflow_rate, width=10).grid(row=1, column=1, sticky='w')
+        tk.Label(syringe_frame, text="Outflow Steps:").grid(row=1, column=2, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.outflow_steps, width=10).grid(row=1, column=3, sticky='w')
+        tk.Button(syringe_frame, text="Start Outflow", command=self.start_outflow).grid(row=1, column=4)
+
+        # Pick and Place controls
+        tk.Label(syringe_frame, text="Pick Rate (s delay):").grid(row=2, column=0, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.pick_rate, width=10).grid(row=2, column=1, sticky='w')
+        tk.Label(syringe_frame, text="Pick Steps:").grid(row=2, column=2, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.pick_steps, width=10).grid(row=2, column=3, sticky='w')
+        tk.Button(syringe_frame, text="Pick", command=self.pick).grid(row=2, column=4)
+
+        tk.Label(syringe_frame, text="Place Rate (s delay):").grid(row=3, column=0, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.place_rate, width=10).grid(row=3, column=1, sticky='w')
+        tk.Label(syringe_frame, text="Place Steps:").grid(row=3, column=2, sticky='w')
+        tk.Entry(syringe_frame, textvariable=self.place_steps, width=10).grid(row=3, column=3, sticky='w')
+        tk.Button(syringe_frame, text="Place", command=self.place).grid(row=3, column=4)
+
+        # Jog buttons
+        jog_frame = tk.Frame(self.root)
+        jog_frame.grid(row=6, column=0, columnspan=4, sticky='w')
+
+        tk.Button(jog_frame, text="Jog X Forward", command=lambda: self.toggle_jog('x_forward')).grid(row=0, column=0)
+        tk.Button(jog_frame, text="Jog X Backward", command=lambda: self.toggle_jog('x_backward')).grid(row=0, column=1)
+        tk.Button(jog_frame, text="Jog Y Forward", command=lambda: self.toggle_jog('y_forward')).grid(row=0, column=2)
+        tk.Button(jog_frame, text="Jog Y Backward", command=lambda: self.toggle_jog('y_backward')).grid(row=0, column=3)
+        tk.Button(jog_frame, text="Jog Z Up", command=lambda: self.toggle_jog('z_forward')).grid(row=1, column=0)
+        tk.Button(jog_frame, text="Jog Z Down", command=lambda: self.toggle_jog('z_backward')).grid(row=1, column=1)
+
+        # Control buttons
+        control_frame = tk.Frame(self.root)
+        control_frame.grid(row=7, column=0, columnspan=4, sticky='w')
+
+        tk.Button(control_frame, text="Engage Motors", command=self.engage_motors).grid(row=0, column=0)
+        tk.Button(control_frame, text="Disengage Motors", command=self.disengage_motors).grid(row=0, column=1)
+        tk.Button(control_frame, text="Emergency Stop", command=self.emergency_stop, fg="red").grid(row=0, column=2)
+        tk.Button(control_frame, text="Quit", command=self.quit).grid(row=0, column=3)
+
+        # Arm control buttons
+        arm_control_frame = tk.Frame(self.root)
+        arm_control_frame.grid(row=8, column=0, columnspan=4, sticky='w')
+
+        tk.Button(arm_control_frame, text="Up", command=lambda: self.move_arm('up')).grid(row=0, column=1)
+        tk.Button(arm_control_frame, text="Down", command=lambda: self.move_arm('down')).grid(row=2, column=1)
+        tk.Button(arm_control_frame, text="Left", command=lambda: self.move_arm('left')).grid(row=1, column=0)
+        tk.Button(arm_control_frame, text="Right", command=lambda: self.move_arm('right')).grid(row=1, column=2)
+        tk.Button(arm_control_frame, text="Z Up", command=lambda: self.move_arm('z_up')).grid(row=0, column=3)
+        tk.Button(arm_control_frame, text="Z Down", command=lambda: self.move_arm('z_down')).grid(row=2, column=3)
+
+        # Zoom and obstacle buttons
+        misc_frame = tk.Frame(self.root)
+        misc_frame.grid(row=9, column=0, columnspan=4, sticky='w')
+
+        tk.Button(misc_frame, text="Zoom In", command=self.zoom_in).grid(row=0, column=0)
+        tk.Button(misc_frame, text="Zoom Out", command=self.zoom_out).grid(row=0, column=1)
+        tk.Button(misc_frame, text="Place Object", command=self.enter_place_object_mode).grid(row=0, column=2)
+        tk.Button(misc_frame, text="Clear Objects", command=self.clear_obstacles).grid(row=0, column=3)
+        tk.Button(misc_frame, text="Set Position", command=self.enter_set_position_mode).grid(row=1, column=0)
+        tk.Button(misc_frame, text="Sync", command=self.sync_position).grid(row=1, column=1)
+
+        # Robot arm visualization
+        self.fig = plt.figure(figsize=(6, 6))
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().grid(row=0, column=4, rowspan=10)
+        self.canvas.mpl_connect('button_press_event', self.on_plot_click)
+        self.update_plot()
+
+        # Z-axis visualization
+        self.z_fig = plt.figure(figsize=(2, 4))
+        self.z_ax = self.z_fig.add_subplot(111)
+        self.z_canvas = FigureCanvasTkAgg(self.z_fig, master=self.root)
+        self.z_canvas.get_tk_widget().grid(row=0, column=5, rowspan=10)
+        self.z_canvas.mpl_connect('button_press_event', self.on_z_plot_click)
+        self.update_z_plot()
+
+    # Syringe pump control functions
+    def start_inflow(self):
+        rate = self.inflow_rate.get()
+        steps = self.inflow_steps.get()
+        threading.Thread(target=self.run_syringe_pump, args=(FORWARD, rate, steps)).start()
+
+    def start_outflow(self):
+        rate = self.outflow_rate.get()
+        steps = self.outflow_steps.get()
+        threading.Thread(target=self.run_syringe_pump, args=(BACKWARD, rate, steps)).start()
+
+    def pick(self):
+        rate = self.pick_rate.get()
+        steps = self.pick_steps.get()
+        threading.Thread(target=self.run_syringe_pump, args=(FORWARD, rate, steps)).start()
+
+    def place(self):
+        rate = self.place_rate.get()
+        steps = self.place_steps.get()
+        threading.Thread(target=self.run_syringe_pump, args=(BACKWARD, rate, steps)).start()
+
+    def run_syringe_pump(self, direction, rate, total_steps):
+        try:
+            lgpio.gpio_write(self.h, SYR_EN, MOTOR_ENABLE_LEVEL)
+            lgpio.gpio_write(self.h, SYR_DIR, direction)
+            for _ in range(total_steps):
+                lgpio.gpio_write(self.h, SYR_PUL, 1)
+                time.sleep(rate / 2)
+                lgpio.gpio_write(self.h, SYR_PUL, 0)
+                time.sleep(rate / 2)
+            # Do not disable the motor here
+        except Exception as e:
+            print(f"Error running syringe pump: {e}")
+            self.emergency_stop()
+
+    # The rest of the class methods remain mostly unchanged...
+    def toggle_jog(self, axis_direction):
+        if not self.running[axis_direction]:
+            self.running[axis_direction] = True
+            threading.Thread(target=self.jog_motor, args=(axis_direction,)).start()
+        else:
+            self.running[axis_direction] = False
+
+    def jog_motor(self, axis_direction):
+        axis, direction = axis_direction.split('_')
+        pul_pin, dir_pin, en_pin, speed_var = self.get_motor_pins(axis)
+        dir_value = FORWARD if direction == 'forward' else BACKWARD
+        try:
+            lgpio.gpio_write(self.h, en_pin, MOTOR_ENABLE_LEVEL)  # Ensure motor is enabled
+            lgpio.gpio_write(self.h, dir_pin, dir_value)
+            while self.running[axis_direction]:
+                lgpio.gpio_write(self.h, pul_pin, 1)
+                time.sleep(speed_var.get())
+                lgpio.gpio_write(self.h, pul_pin, 0)
+                time.sleep(speed_var.get())
+            # Do not disable motor here to keep it engaged
+        except Exception as e:
+            print(f"Error in jog_motor for {axis_direction}: {e}")
+            self.emergency_stop()
+
+    def get_motor_pins(self, axis):
+        if axis == 'x':
+            return X_PUL, X_DIR, X_EN, self.speed_x
+        elif axis == 'y':
+            return Y_PUL, Y_DIR, Y_EN, self.speed_y
+        elif axis == 'z':
+            return Z_PUL, Z_DIR, Z_EN, self.speed_z
+
+    def engage_motors(self):
+        for en_pin in [X_EN, Y_EN, Z_EN, SYR_EN]:
+            lgpio.gpio_write(self.h, en_pin, MOTOR_ENABLE_LEVEL)
+
+    def disengage_motors(self):
+        for en_pin in [X_EN, Y_EN, Z_EN, SYR_EN]:
+            lgpio.gpio_write(self.h, en_pin, MOTOR_DISABLE_LEVEL)
+
+    def move_arm(self, direction):
+        # Movement increment
+        delta = self.move_increment.get()  # Unit distance
+        if direction == 'up':
+            new_x = self.x
+            new_y = self.y + delta
+        elif direction == 'down':
+            new_x = self.x
+            new_y = self.y - delta
+        elif direction == 'left':
+            new_x = self.x - delta
+            new_y = self.y
+        elif direction == 'right':
+            new_x = self.x + delta
+            new_y = self.y
+        else:
+            new_x = self.x
+            new_y = self.y
+
+        # Z-axis movement
+        if direction == 'z_up':
+            new_z = self.z + delta
+            self.move_z_axis(new_z)
+            return
+        elif direction == 'z_down':
+            new_z = self.z - delta
+            self.move_z_axis(new_z)
+            return
+
+        # Move to new (x, y) position
+        self.move_to_point(new_x, new_y)
+
+    def move_to_point(self, x_target, y_target):
+        # Calculate inverse kinematics
+        try:
+            L1 = self.L1.get()
+            L2 = self.L2.get()
+            D = (x_target ** 2 + y_target ** 2) ** 0.5
+            if D > (L1 + L2) or D < abs(L1 - L2):
+                raise ValueError(f"Unreachable position: Target distance {D:.2f} mm outside of arm reach ({abs(L1 - L2):.2f} mm to {L1 + L2:.2f} mm)")
+            cos_theta2 = ((x_target ** 2) + (y_target ** 2) - (L1 ** 2) - (L2 ** 2)) / (2 * L1 * L2)
+            # Clamp cos_theta2 to [-1, 1] to avoid numerical errors
+            cos_theta2 = max(min(cos_theta2, 1), -1)
+            theta2_target = math.acos(cos_theta2)
+            k1 = L1 + L2 * math.cos(theta2_target)
+            k2 = L2 * math.sin(theta2_target)
+            theta1_target = math.atan2(y_target, x_target) - math.atan2(k2, k1)
+        except ValueError as e:
+            print(f"Error in inverse kinematics: {e}")
+            return
+
+        # Calculate steps to move
+        delta_theta1 = theta1_target - self.theta1
+        delta_theta2 = theta2_target - self.theta2
+
+        steps_theta1 = int(delta_theta1 * self.STEPS_PER_RADIAN_X.get())
+        steps_theta2 = int(delta_theta2 * self.STEPS_PER_RADIAN_Y.get())
+
+        direction_theta1 = FORWARD if steps_theta1 >= 0 else BACKWARD
+        direction_theta2 = FORWARD if steps_theta2 >= 0 else BACKWARD
+
+        # Move motors with acceleration
+        threading.Thread(target=self.run_motor_steps, args=(
+            X_PUL, X_DIR, X_EN, self.speed_x, direction_theta1, abs(steps_theta1),
+            self.acceleration.get(), self.deceleration.get())).start()
+        threading.Thread(target=self.run_motor_steps, args=(
+            Y_PUL, Y_DIR, Y_EN, self.speed_y, direction_theta2, abs(steps_theta2),
+            self.acceleration.get(), self.deceleration.get())).start()
+
+        # Update current positions
+        self.theta1 = theta1_target
+        self.theta2 = theta2_target
+        self.x = x_target
+        self.y = y_target
+
+        # Update plot
+        self.update_plot()
+
+        # Log movement
+        self.log_queue.put((self.x, self.y, self.z, self.theta1, self.theta2, time.time()))
+
+    def move_z_axis(self, z_target):
+        delta_z = z_target - self.z
+        steps_z = int(delta_z * self.STEPS_PER_UNIT_Z.get())
+        direction_z = FORWARD if steps_z >= 0 else BACKWARD
+        threading.Thread(target=self.run_motor_steps, args=(
+            Z_PUL, Z_DIR, Z_EN, self.speed_z, direction_z, abs(steps_z),
+            self.acceleration.get(), self.deceleration.get())).start()
+        self.z = z_target
+        self.update_z_plot()
+        self.log_queue.put((self.x, self.y, self.z, self.theta1, self.theta2, time.time()))
+
+    def run_motor_steps(self, pul_pin, dir_pin, en_pin, speed_var, direction, steps, accel, decel):
+        try:
+            lgpio.gpio_write(self.h, en_pin, MOTOR_ENABLE_LEVEL)  # Ensure motor is enabled
+            lgpio.gpio_write(self.h, dir_pin, direction)
+
+            max_speed_delay = speed_var.get()
+            min_speed_delay = 0.0001  # Minimum delay between steps (maximum speed)
+
+            # Simple method: Use fixed delay for now
+            delay = max_speed_delay
+
+            for _ in range(steps):
+                lgpio.gpio_write(self.h, pul_pin, 1)
+                time.sleep(delay / 2)
+                lgpio.gpio_write(self.h, pul_pin, 0)
+                time.sleep(delay / 2)
+
+            # Do not disable motor here to keep it engaged
+        except Exception as e:
+            print(f"Error running motor steps: {e}")
+            self.emergency_stop()
+
+    def update_plot(self):
+        # Save current x and y limits
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        self.ax.clear()
+        # Joint positions
+        L1 = self.L1.get()
+        L2 = self.L2.get()
+        joint1_x = L1 * math.cos(self.theta1)
+        joint1_y = L1 * math.sin(self.theta1)
+        end_effector_x = joint1_x + L2 * math.cos(self.theta1 + self.theta2)
+        end_effector_y = joint1_y + L2 * math.sin(self.theta1 + self.theta2)
+        self.ax.plot([0, joint1_x], [0, joint1_y], 'r-')
+        self.ax.plot([joint1_x, end_effector_x], [joint1_y, end_effector_y], 'b-')
+        self.ax.plot(end_effector_x, end_effector_y, 'go')  # End effector
+        for obstacle in self.obstacles:
+            self.ax.add_patch(plt.Circle(obstacle, OBSTACLE_RADIUS, color='black'))
+
+        # Draw the reachable workspace circle
+        workspace_radius = L1 + L2
+        workspace_circle = plt.Circle((0, 0), workspace_radius, color='gray', fill=False, linestyle='--')
+        self.ax.add_patch(workspace_circle)
+
+        # Draw inner circle representing minimum reach (if applicable)
+        inner_radius = abs(L1 - L2)
+        if inner_radius > 0:
+            inner_circle = plt.Circle((0, 0), inner_radius, color='gray', fill=False, linestyle='--')
+            self.ax.add_patch(inner_circle)
+
+        self.ax.set_aspect('equal')
+
+        # Restore previous plot limits to maintain zoom level
+        if xlim and ylim:
+            self.ax.set_xlim(xlim)
+            self.ax.set_ylim(ylim)
+        else:
+            # Set plot limits
+            limit = workspace_radius + 50  # Add some margin
+            self.ax.set_xlim(-limit, limit)
+            self.ax.set_ylim(-limit, limit)
+
+        self.canvas.draw()
+
+    def update_z_plot(self):
+        # Save current y limits
+        ylim = self.z_ax.get_ylim()
+        self.z_ax.clear()
+        self.z_ax.plot([0, 0], [0, self.z], 'g-')
+        self.z_ax.plot(0, self.z, 'ro')  # End effector
+        self.z_ax.set_xlim([-1, 1])
+        # Restore previous y limits
+        if ylim:
+            self.z_ax.set_ylim(ylim)
+        else:
+            self.z_ax.set_ylim([0, self.L1.get() + self.L2.get()])
+        self.z_canvas.draw()
+
+    def on_plot_click(self, event):
+        if event.inaxes != self.ax:
+            return
+        x_click = event.xdata
+        y_click = event.ydata
+        print(f"Plot clicked at: ({x_click}, {y_click})")
+        if self.place_object_mode:
+            # Place an object at the clicked location
+            self.obstacles.append((x_click, y_click))
+            self.update_plot()
+            self.place_object_mode = False
+            print("Object placed.")
+        elif self.sync_mode:
+            # Set the current position without moving motors
+            self.x = x_click
+            self.y = y_click
+            # Calculate inverse kinematics to update theta1 and theta2
+            try:
+                L1 = self.L1.get()
+                L2 = self.L2.get()
+                D = (self.x ** 2 + self.y ** 2) ** 0.5
+                if D > (L1 + L2) or D < abs(L1 - L2):
+                    raise ValueError(f"Unreachable position: Target distance {D:.2f} mm outside of arm reach ({abs(L1 - L2):.2f} mm to {L1 + L2:.2f} mm)")
+                cos_theta2 = ((self.x ** 2) + (self.y ** 2) - (L1 ** 2) - (L2 ** 2)) / (2 * L1 * L2)
+                # Clamp cos_theta2 to [-1, 1] to avoid numerical errors
+                cos_theta2 = max(min(cos_theta2, 1), -1)
+                self.theta2 = math.acos(cos_theta2)
+                k1 = L1 + L2 * math.cos(self.theta2)
+                k2 = L2 * math.sin(self.theta2)
+                self.theta1 = math.atan2(self.y, self.x) - math.atan2(k2, k1)
+            except ValueError as e:
+                print(f"Error in inverse kinematics during sync: {e}")
+                return
+            self.update_plot()
+            self.sync_mode = False
+            print("Position set. Now click 'Sync' to synchronize.")
+        else:
+            # Move to the clicked point
+            self.move_to_point(x_click, y_click)
+
+    def on_z_plot_click(self, event):
+        if event.inaxes != self.z_ax:
+            return
+        z_click = event.ydata
+        print(f"Z Plot clicked at: {z_click}")
+        if self.sync_mode:
+            self.z = z_click
+            self.update_z_plot()
+            self.sync_mode = False
+            print("Z position set. Now click 'Sync' to synchronize.")
+        else:
+            self.move_z_axis(z_click)
+
+    def zoom_in(self):
+        x_center = self.x
+        y_center = self.y
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        x_range = (xlim[1] - xlim[0]) * 0.8
+        y_range = (ylim[1] - ylim[0]) * 0.8
+        self.ax.set_xlim(x_center - x_range/2, x_center + x_range/2)
+        self.ax.set_ylim(y_center - y_range/2, y_center + y_range/2)
+        self.canvas.draw()
+
+    def zoom_out(self):
+        x_center = self.x
+        y_center = self.y
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        x_range = (xlim[1] - xlim[0]) * 1.2
+        y_range = (ylim[1] - ylim[0]) * 1.2
+        self.ax.set_xlim(x_center - x_range/2, x_center + x_range/2)
+        self.ax.set_ylim(y_center - y_range/2, y_center + y_range/2)
+        self.canvas.draw()
+
+    def enter_place_object_mode(self):
+        self.place_object_mode = True
+        print("Click on the plot to place an object.")
+
+    def clear_obstacles(self):
+        self.obstacles = []
+        self.update_plot()
+
+    def check_collision(self, x_target, y_target):
+        # Check if the arm collides with any obstacles
+        L1 = self.L1.get()
+        L2 = self.L2.get()
+        joint1_x = L1 * math.cos(self.theta1)
+        joint1_y = L1 * math.sin(self.theta1)
+        for obstacle in self.obstacles:
+            dist1 = math.hypot(joint1_x - obstacle[0], joint1_y - obstacle[1])
+            dist2 = math.hypot(x_target - obstacle[0], y_target - obstacle[1])
+            if dist1 < OBSTACLE_RADIUS or dist2 < OBSTACLE_RADIUS:
+                return True
+        return False
+
+    def sync_position(self):
+        # Placeholder for actual motor position reading
+        # Set to current known positions
+        print("Synchronizing GUI with current positions.")
+        # Positions are already set in on_plot_click during sync_mode
+        print("Synchronization complete.")
+
+    def enter_set_position_mode(self):
+        self.sync_mode = True
+        print("Click on the plot to set the current arm position.")
+
+    def log_movements(self):
+        with open(f"movements_{self.session_id}.log", "w") as log_file:
+            while self.logging_active:
+                try:
+                    x, y, z, theta1, theta2, timestamp = self.log_queue.get(timeout=1)
+                    log_file.write(f"{timestamp},{x},{y},{z},{theta1},{theta2}\n")
+                    self.log_queue.task_done()
+                except queue.Empty:
+                    continue
+
+    def emergency_stop(self):
+        # Immediately stop all motors and running threads
+        for key in self.running:
+            self.running[key] = False
+        self.logging_active = False
+        self.disengage_motors()
+
+    def update_gui(self):
+        # Schedule the update_gui method to run again after 100ms
+        self.root.after(100, self.update_gui)
+
+    def quit(self):
+        # Disable motors and release GPIO resources
+        self.logging_active = False
+        for key in self.running:
+            self.running[key] = False
+        self.disengage_motors()
+        try:
+            lgpio.gpiochip_close(self.h)
+        except Exception as e:
+            print(f"Error closing GPIO: {e}")
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MotorControlGUI(root)
+    root.mainloop()
